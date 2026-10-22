@@ -10,6 +10,8 @@
 	<string>SpaceDock</string>
 	<key>CFBundleDisplayName</key>
 	<string>SpaceDock</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

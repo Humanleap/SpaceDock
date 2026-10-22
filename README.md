@@ -1,6 +1,6 @@
 # SpaceDock
 
-SpaceDock keeps the Mac Dock in the same left-to-right order as your full-screen Spaces. Command-Tab uses that same order.
+SpaceDock keeps the Mac Dock in the same left-to-right order as your full-screen Spaces. Command-Tab lists those same full-screen apps, in that order.
 
 Spaces stay in charge. Move a full-screen app and the Dock follows. Command-Tab lists the same apps, left to right. Let go of Command to switch. Shift goes backwards. Escape cancels.
 
@@ -14,11 +14,21 @@ cd SpaceDock
 make install
 ```
 
-A SpaceDock icon appears in the menu bar. macOS asks you to allow SpaceDock to control the computer. Allow it, or Command-Tab stays the usual most-recent list. The Dock order itself does not need that permission.
+It runs in the background. Nothing is added to the menu bar or the Dock. macOS asks you to allow SpaceDock to control the computer. Allow it, or Command-Tab stays the usual most-recent list. The Dock order itself does not need that permission.
 
 If you allow it while SpaceDock is already running, it restarts itself once so Command-Tab can take over.
 
-It starts again at login. Quit is in the menu. `make uninstall` removes it.
+It starts again at login. `make uninstall` removes it.
+
+## Update
+
+In the SpaceDock folder:
+
+```
+make update
+```
+
+That downloads the latest copy, rebuilds it, and starts it again. Updating on the same Mac keeps the Accessibility permission.
 
 To sign it with your own certificate: `make install SIGN_ID="Apple Development: Your Name (TEAMID)"`.
 

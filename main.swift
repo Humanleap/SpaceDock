@@ -48,6 +48,9 @@ private func decideSwitch(type: CGEventType, keyCode: Int64, flags: CGEventFlags
         let forward = !flags.contains(.maskShift)
         return visible ? .move(forward: forward) : .open(forward: forward)
     }
+    if type == .keyDown && visible && plain && (keyCode == 123 || keyCode == 124) {
+        return .move(forward: keyCode == 124)
+    }
     if visible && (type == .keyDown || type == .keyUp) { return .swallow }
     return .pass
 }
@@ -76,10 +79,8 @@ enum Main {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var statusItem: NSStatusItem!
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
-    private var apps: [SpaceApp] = []
     private var pending: [String] = []
     private var pendingSince: Date?
     private var busyUntil = Date.distantPast
@@ -87,81 +88,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let switcher = Switcher()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "Spaces")
-            image?.isTemplate = true
-            button.image = image
-            button.toolTip = "Dock follows your spaces"
-        }
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
-
         let timer = Timer(timeInterval: 1.2, repeats: true) { [weak self] _ in
             self?.tick(force: false)
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        switcher.prepare()
         switcher.start()
         tick(force: false)
-    }
-
-    func menuWillOpen(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let heading = NSMenuItem(title: "Dock follows your spaces", action: nil, keyEquivalent: "")
-        heading.isEnabled = false
-        menu.addItem(heading)
-        if !switcher.isOn {
-            let allow = NSMenuItem(title: "Allow the app switcher", action: #selector(allowSwitcher), keyEquivalent: "")
-            allow.target = self
-            menu.addItem(allow)
-        }
-        if apps.isEmpty {
-            let none = NSMenuItem(title: "No full-screen apps", action: nil, keyEquivalent: "")
-            none.isEnabled = false
-            menu.addItem(none)
-        } else {
-            for (index, app) in apps.enumerated() {
-                let item = NSMenuItem(title: "\(index + 1)  \(app.label)", action: #selector(openApp(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = app.bundleID
-                menu.addItem(item)
-            }
-        }
-        if !pending.isEmpty {
-            let updating = NSMenuItem(title: "Updating the Dock…", action: nil, keyEquivalent: "")
-            updating.isEnabled = false
-            menu.addItem(updating)
-        }
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-    }
-
-    @objc private func allowSwitcher() {
-        switcher.prompt()
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
-
-    @objc private func openApp(_ sender: NSMenuItem) {
-        guard let bundleID = sender.representedObject as? String,
-              let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
-        else { return }
-        app.activate(from: .current, options: [])
     }
 
     private func tick(force: Bool) {
         guard !switcher.isStopping else { return }
         switcher.installIfNeeded()
+        switcher.prepare()
         switcher.recover()
         guard Date() >= busyUntil else { return }
-        guard let spaces = fullscreenApps() else { return }
-        apps = spaces
+        guard let spaces = spaceApps() else { return }
 
         let current = dockTiles()
         var added = Set(UserDefaults.standard.stringArray(forKey: addedKey) ?? [])
@@ -170,7 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let have = current.map(tileID)
         // static-only makes the Dock ignore pinned order and show apps in the order they were opened.
         let hidesPinOrder = (CFPreferencesCopyAppValue("static-only" as CFString, dockDomain) as? Bool) == true
-        if wanted == have && !hidesPinOrder {
+        if wanted == have && !hidesPinOrder && !iconsStale(current, spaces: spaces) {
             pending = []
             pendingSince = nil
             failedApplies = 0
@@ -188,34 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         apply(desired, added: added, names: spaces.map(\.label))
     }
 
-    /// Full-screen spaces, left to right, on the display that has the most of them.
-    private func fullscreenApps() -> [SpaceApp]? {
-        guard let displays = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]],
-              !displays.isEmpty
-        else {
-            log("Could not read spaces")
-            return nil
-        }
-        let ranked = displays.sorted { fullscreenCount($0) > fullscreenCount($1) }
-        guard let display = ranked.first, fullscreenCount(display) > 0 else { return [] }
-        let spaces = display["Spaces"] as? [[String: Any]] ?? []
-        var apps: [SpaceApp] = []
-        var seen = Set<String>()
-        for space in spaces {
-            guard number(space["type"]) == 4, let pid = pidValue(space["pid"]) else { continue }
-            guard let running = NSRunningApplication(processIdentifier: pid),
-                  let bundleID = running.bundleIdentifier,
-                  let url = running.bundleURL,
-                  seen.insert(bundleID).inserted
-            else { continue }
-            let label = clean(running.localizedName ?? url.deletingPathExtension().lastPathComponent)
-            apps.append(SpaceApp(bundleID: bundleID, url: url, label: label))
-        }
-        return apps
-    }
-
     private func arrangedTiles(current: [[String: Any]], spaces: [SpaceApp], added: inout Set<String>) -> [[String: Any]] {
-        let sample = current.first { ($0["tile-type"] as? String) == "file-tile" }
         var byID: [String: [String: Any]] = [:]
         for tile in current {
             let id = tileID(tile)
@@ -223,12 +139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var result: [[String: Any]] = []
         var seen = Set<String>()
+        var guids = Set<Int>()
+        var mods = Set<Int>()
         for app in spaces where seen.insert(app.bundleID).inserted {
-            if let tile = byID[app.bundleID] {
+            if let tile = byID[app.bundleID], claimTile(tile, guids: &guids, mods: &mods) {
                 result.append(tile)
             } else {
-                result.append(makeTile(like: sample, app: app))
-                added.insert(app.bundleID)
+                result.append(makeTile(app: app, guids: &guids, mods: &mods))
+                if byID[app.bundleID] == nil { added.insert(app.bundleID) }
             }
         }
         let spaceIDs = Set(spaces.map(\.bundleID))
@@ -268,70 +186,149 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func makeTile(like sample: [String: Any]?, app: SpaceApp) -> [String: Any] {
-        var tile = sample ?? ["tile-type": "file-tile"]
-        var data = tile["tile-data"] as? [String: Any] ?? [:]
+    /// The Dock caches an icon by GUID and by this date. A shared date keeps the first app's icon.
+    private func makeTile(app: SpaceApp, guids: inout Set<Int>, mods: inout Set<Int>) -> [String: Any] {
         var url = app.url
         if !url.hasDirectoryPath {
             url = URL(fileURLWithPath: url.path, isDirectory: true)
         }
-        data["bundle-identifier"] = app.bundleID
-        data["file-label"] = app.label
-        data["file-type"] = 1
-        data["dock-extra"] = false
-        data["is-beta"] = false
-        data["file-data"] = [
-            "_CFURLString": url.absoluteString,
-            "_CFURLStringType": 15,
+        var guid = 0
+        repeat {
+            guid = Int.random(in: 1_000_000_000..<10_000_000_000)
+        } while !guids.insert(guid).inserted
+        let mod = uniqueModDate(url, salt: app.bundleID, used: &mods)
+        var data: [String: Any] = [
+            "bundle-identifier": app.bundleID,
+            "file-label": app.label,
+            "file-type": 41,
+            "dock-extra": false,
+            "is-beta": false,
+            "file-mod-date": mod,
+            "parent-mod-date": uniqueModDate(url.deletingLastPathComponent(), salt: app.bundleID + "/", used: &mods),
+            "file-data": [
+                "_CFURLString": url.absoluteString,
+                "_CFURLStringType": 15,
+            ],
         ]
         if let book = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             data["book"] = book
         }
-        tile["tile-data"] = data
-        tile["tile-type"] = "file-tile"
-        return tile
+        return ["tile-type": "file-tile", "GUID": guid, "tile-data": data]
+    }
+
+    private func claimTile(_ tile: [String: Any], guids: inout Set<Int>, mods: inout Set<Int>) -> Bool {
+        let data = tile["tile-data"] as? [String: Any] ?? [:]
+        guard (data["file-type"] as? NSNumber)?.intValue == 41 else { return false }
+        let guid = (tile["GUID"] as? NSNumber)?.intValue ?? 0
+        let mod = (data["file-mod-date"] as? NSNumber)?.intValue ?? 0
+        guard guid != 0, mod != 0 else { return false }
+        return guids.insert(guid).inserted && mods.insert(mod).inserted
+    }
+
+    private func iconsStale(_ tiles: [[String: Any]], spaces: [SpaceApp]) -> Bool {
+        let spaceIDs = Set(spaces.map(\.bundleID))
+        var guids = Set<Int>()
+        var mods = Set<Int>()
+        for tile in tiles where spaceIDs.contains(tileID(tile)) {
+            if !claimTile(tile, guids: &guids, mods: &mods) { return true }
+        }
+        return false
+    }
+
+    private func uniqueModDate(_ url: URL, salt: String, used: inout Set<Int>) -> Int {
+        let unix = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        var date = Int(unix) + 2_082_844_800 + stableMix(salt)
+        while !used.insert(date).inserted { date += 1 }
+        return date
+    }
+
+    private func stableMix(_ text: String) -> Int {
+        var hash = 5381
+        for byte in text.utf8 {
+            hash = ((hash << 5) &+ hash) &+ Int(byte)
+        }
+        let mixed = hash % 100_000
+        return mixed < 0 ? -mixed : mixed
     }
 }
 
 private final class StripView: NSView {
-    var names: [String] = []
     var icons: [NSImage] = []
     var selection = 0
-    var cellWidth: CGFloat = 96
+    var iconSide: CGFloat = 148
+    var spacing: CGFloat = 16
+    var padX: CGFloat = 14
+    var onHover: ((Int) -> Void)?
+    var onClick: ((Int) -> Void)?
+    let padTop: CGFloat = 10
+    let padBottom: CGFloat = 10
 
     override var isOpaque: Bool { false }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.white.withAlphaComponent(0.16).setStroke()
-        let border = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 22, yRadius: 22)
-        border.lineWidth = 1
-        border.stroke()
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-        let iconCenterY = bounds.height - 43
-        for index in names.indices {
-            let selected = index == selection
-            let rect = NSRect(x: 8 + cellWidth * CGFloat(index), y: 0, width: cellWidth, height: bounds.height)
-            let iconSize: CGFloat = selected ? 62 : 52
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+        mouseMoved(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard let index = index(at: event.locationInWindow) else { return }
+        onHover?(index)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let index = index(at: event.locationInWindow) else { return }
+        onClick?(index)
+    }
+
+    private func index(at windowPoint: NSPoint) -> Int? {
+        let point = convert(windowPoint, from: nil)
+        let stride = iconSide + spacing
+        guard stride > 0 else { return nil }
+        let index = Int((point.x - padX + spacing / 2) / stride)
+        return icons.indices.contains(index) ? index : nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let iconY = padBottom
+        let stride = iconSide + spacing
+        let outset = max(2, iconSide * 0.025)
+        for index in icons.indices {
             let iconRect = NSRect(
-                x: rect.midX - iconSize / 2,
-                y: iconCenterY - iconSize / 2,
-                width: iconSize,
-                height: iconSize
+                x: padX + CGFloat(index) * stride,
+                y: iconY,
+                width: iconSide,
+                height: iconSide
             )
-            if selected {
-                NSColor.white.withAlphaComponent(0.2).setFill()
-                NSBezierPath(roundedRect: iconRect.insetBy(dx: -10, dy: -10), xRadius: 16, yRadius: 16).fill()
+            if index == selection {
+                let ring = iconRect.insetBy(dx: -outset, dy: -outset)
+                let radius = iconSide * 0.225 + outset
+                let path = NSBezierPath(roundedRect: ring, xRadius: radius, yRadius: radius)
+                NSColor.black.withAlphaComponent(0.32).setFill()
+                path.fill()
             }
-            icons[index].draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: selected ? 1 : 0.92)
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.alignment = .center
-            paragraph.lineBreakMode = .byTruncatingTail
-            let nameRect = NSRect(x: rect.minX + 2, y: 10, width: rect.width - 4, height: 16)
-            names[index].draw(in: nameRect, withAttributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: selected ? .semibold : .regular),
-                .foregroundColor: NSColor.white.withAlphaComponent(selected ? 1 : 0.78),
-                .paragraphStyle: paragraph,
-            ])
+            icons[index].draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
         }
     }
 }
@@ -349,11 +346,23 @@ final class Switcher {
     private var selection = 0
     private var visible = false
     private var reportedBlocked = false
+    private var reportedPass = false
     private var wasTrusted = AXIsProcessTrusted()
+    private var activity: NSObjectProtocol?
+    private var rebuildAfter = Date.distantPast
+    private var tapBroken = false
+    private var readyItems: [SwitchItem] = []
+    private var readyIcons: [NSImage] = []
+    private let readyLock = NSLock()
+    private let stateLock = NSLock()
+    private var keyLoop: CFRunLoop?
+    private let keyLoopReady = DispatchSemaphore(value: 0)
+    private var keyLoopStarted = false
+    private var commandAt = Date.distantPast
 
     init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 124),
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 92),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -366,24 +375,40 @@ final class Switcher {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = false
+        panel.acceptsMouseMovedEvents = true
         panel.animationBehavior = .none
         panel.isReleasedWhenClosed = false
-        let effect = NSVisualEffectView()
-        effect.material = .hudWindow
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 22
-        effect.layer?.masksToBounds = true
-        panel.contentView = effect
-        strip.frame = effect.bounds
         strip.autoresizingMask = [.width, .height]
-        effect.addSubview(strip)
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = 30
+            if #available(macOS 27.0, *) {
+                glass.effectIsInteractive = false
+            }
+            glass.contentView = strip
+            panel.contentView = glass
+        } else {
+            let effect = NSVisualEffectView()
+            effect.material = .hudWindow
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.layer?.cornerRadius = 30
+            effect.layer?.masksToBounds = true
+            panel.contentView = effect
+            effect.addSubview(strip)
+        }
+        strip.onHover = { [weak self] index in self?.hover(index) }
+        strip.onClick = { [weak self] index in self?.click(index) }
         Switcher.shared = self
     }
 
     func start() {
+        if activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated], reason: "App switcher")
+        }
         if !AXIsProcessTrusted() && !UserDefaults.standard.bool(forKey: "askedForAccessibility") {
             UserDefaults.standard.set(true, forKey: "askedForAccessibility")
             prompt()
@@ -401,11 +426,51 @@ final class Switcher {
     }
 
     func installIfNeeded() {
-        if isOn || isStopping { return }
+        if isStopping { return }
+        ensureKeyLoop()
+        guard let keyLoop else { return }
+        // tapIsEnabled talks to the window server. Doing that on the key thread stalls
+        // the listener, macOS drops the tap, and Command-Tab falls back to the system.
+        if tapHealthy() { return }
+        CFRunLoopPerformBlock(keyLoop, CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            self?.installOnKeyLoop()
+        }
+        CFRunLoopWakeUp(keyLoop)
+    }
+
+    /// The key listener has to live on its own loop. The main thread reads Spaces, and a slow
+    /// listener lets macOS show its own switcher and then switch this one off.
+    private func ensureKeyLoop() {
+        if keyLoopStarted { return }
+        keyLoopStarted = true
+        Thread.detachNewThread { [weak self] in
+            guard let self else { return }
+            let loop = CFRunLoopGetCurrent()
+            self.keyLoop = loop
+            // An empty loop returns at once. A parked source keeps it waiting for keys.
+            var context = CFRunLoopSourceContext()
+            if let parked = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context) {
+                CFRunLoopAddSource(loop, parked, .commonModes)
+            }
+            self.installOnKeyLoop()
+            self.keyLoopReady.signal()
+            CFRunLoopRun()
+        }
+        keyLoopReady.wait()
+    }
+
+    private func installOnKeyLoop() {
+        if isStopping { return }
+        if Date() < rebuildAfter { return }
+        rebuildAfter = Date().addingTimeInterval(3)
+        stateLock.lock()
+        let restarting = tap != nil
+        stateLock.unlock()
+        removeTap()
         let trusted = AXIsProcessTrusted()
         if trusted && !wasTrusted {
             wasTrusted = true
-            relaunch()
+            DispatchQueue.main.async { [weak self] in self?.relaunch() }
             return
         }
         wasTrusted = trusted
@@ -426,18 +491,91 @@ final class Switcher {
             return
         }
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
         CGEvent.tapEnable(tap: port, enable: true)
+        guard CGEvent.tapIsEnabled(tap: port) else {
+            reportBlocked("Switcher tap did not stay on. Command-Tab is unchanged.")
+            return
+        }
+        stateLock.lock()
         tap = port
-        self.source = source
         isOn = true
+        tapBroken = false
+        stateLock.unlock()
+        self.source = source
+        readyLock.lock()
+        let names = readyItems.map(\.label)
+        readyLock.unlock()
+        if restarting {
+            log("Switcher tap stopped. Back on. Order: \(names.joined(separator: ", "))")
+        } else {
+            log("Switcher on. Order: \(names.joined(separator: ", "))")
+        }
+    }
+
+    /// Runs on the main thread. The window-server check must not run on the key thread.
+    private func tapHealthy() -> Bool {
+        stateLock.lock()
+        let port = tap
+        let broken = tapBroken
+        let on = isOn
+        stateLock.unlock()
+        guard on, !broken, let port else { return false }
+        return CGEvent.tapIsEnabled(tap: port)
+    }
+
+    func prepare() {
         let found = switcherItems()
-        let whereFrom = found.fromDock ? "the Dock" : "pinned apps"
-        log("Switcher on, from \(whereFrom). Order: \(found.items.map(\.label).joined(separator: ", "))")
+        guard !found.isEmpty else { return }
+        readyLock.lock()
+        let same = found.map(\.bundleID) == readyItems.map(\.bundleID) && readyIcons.count == found.count
+        readyLock.unlock()
+        if same {
+            readyLock.lock()
+            readyItems = found
+            readyLock.unlock()
+            return
+        }
+        let icons = found.map { item in
+            let icon = NSWorkspace.shared.icon(forFile: item.url.path)
+            icon.size = NSSize(width: 256, height: 256)
+            return icon
+        }
+        readyLock.lock()
+        readyItems = found
+        readyIcons = icons
+        readyLock.unlock()
+    }
+
+    private func isReady() -> Bool {
+        readyLock.lock()
+        defer { readyLock.unlock() }
+        return !readyItems.isEmpty && readyIcons.count == readyItems.count
+    }
+
+    private func removeTap() {
+        if let source {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+        stateLock.lock()
+        let port = tap
+        tap = nil
+        isOn = false
+        tapBroken = false
+        stateLock.unlock()
+        if let port {
+            CGEvent.tapEnable(tap: port, enable: false)
+        }
+        source = nil
     }
 
     func recover() {
-        guard visible else { return }
+        guard isVisible() else { return }
+        stateLock.lock()
+        let since = Date().timeIntervalSince(commandAt)
+        stateLock.unlock()
+        // A Command chord just arrived. The hardware flag can flicker while it is held.
+        if since < 1.5 { return }
         if !CGEventSource.flagsState(.hidSystemState).contains(.maskCommand) {
             commit()
         }
@@ -445,60 +583,153 @@ final class Switcher {
 
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            stateLock.lock()
+            let port = tap
+            stateLock.unlock()
+            if let port {
+                CGEvent.tapEnable(tap: port, enable: true)
+            }
             return nil
         }
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        switch decideSwitch(type: type, keyCode: keyCode, flags: event.flags, visible: visible) {
+        let flags = event.flags
+        note(type: type, flags: flags)
+        switch decideSwitch(type: type, keyCode: keyCode, flags: flags, visible: isVisible()) {
         case .pass:
             return Unmanaged.passUnretained(event)
         case .swallow:
             return nil
-        case .open(let forward):
-            return begin(forward: forward) ? nil : Unmanaged.passUnretained(event)
-        case .move(let forward):
-            move(forward: forward)
+        case .open(let forward), .move(let forward):
+            guard isReady() || isVisible() else {
+                if !reportedPass {
+                    reportedPass = true
+                    log("Switcher let Command-Tab through.")
+                }
+                return Unmanaged.passUnretained(event)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.visible {
+                    self.move(forward: forward)
+                } else {
+                    _ = self.begin(forward: forward)
+                }
+            }
             return nil
         case .commit:
-            commit()
+            DispatchQueue.main.async { [weak self] in self?.commit() }
             return Unmanaged.passUnretained(event)
         case .cancel:
-            cancel()
+            DispatchQueue.main.async { [weak self] in self?.cancel() }
             return nil
         }
     }
 
+    private func note(type: CGEventType, flags: CGEventFlags) {
+        stateLock.lock()
+        if flags.contains(.maskCommand) {
+            commandAt = Date()
+        } else if type == .flagsChanged {
+            commandAt = .distantPast
+        }
+        stateLock.unlock()
+    }
+
+    private func isVisible() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return visible
+    }
+
+    private func setVisible(_ on: Bool) {
+        stateLock.lock()
+        visible = on
+        stateLock.unlock()
+    }
+
     private func begin(forward: Bool) -> Bool {
-        let found = switcherItems()
-        guard !found.items.isEmpty else { return false }
-        items = found.items
+        readyLock.lock()
+        let found = readyItems
+        let icons = readyIcons
+        readyLock.unlock()
+        guard !found.isEmpty, icons.count == found.count else { return false }
+        items = found
         selection = initialIndex(forward: forward)
-        strip.names = items.map(\.label)
-        strip.icons = items.map { NSWorkspace.shared.icon(forFile: $0.url.path) }
-        strip.selection = selection
+        strip.icons = icons
         let screen = targetScreen()
         let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
-        let count = CGFloat(items.count)
-        var cell: CGFloat = 96
-        let chrome: CGFloat = 16
-        if chrome + cell * count > visibleFrame.width - 48 {
-            cell = max(68, (visibleFrame.width - 48 - chrome) / count)
-        }
-        strip.cellWidth = cell
-        let width = chrome + cell * count
-        let height: CGFloat = 124
+        let fitted = metrics(count: items.count, maxWidth: visibleFrame.width)
+        strip.iconSide = fitted.icon
+        strip.spacing = fitted.spacing
+        strip.padX = fitted.padX
         let frame = NSRect(
-            x: visibleFrame.midX - width / 2,
-            y: visibleFrame.midY - height / 2,
-            width: width,
-            height: height
+            x: visibleFrame.midX - fitted.width / 2,
+            y: visibleFrame.midY - fitted.height / 2,
+            width: fitted.width,
+            height: fitted.height
         )
         panel.setFrame(frame, display: true)
         strip.frame = panel.contentView?.bounds ?? NSRect(origin: .zero, size: frame.size)
+        showSelection()
         strip.needsDisplay = true
         panel.orderFrontRegardless()
-        visible = true
+        strip.updateTrackingAreas()
+        setVisible(true)
         return true
+    }
+
+    private func hover(_ index: Int) {
+        guard items.indices.contains(index), index != selection else { return }
+        selection = index
+        showSelection()
+    }
+
+    /// Ten or fewer apps use a 148pt icon. The row shrinks to fit the screen.
+    private func metrics(count: Int, maxWidth: CGFloat) -> (icon: CGFloat, spacing: CGFloat, padX: CGFloat, width: CGFloat, height: CGFloat) {
+        let n = CGFloat(max(count, 1))
+        let samples: [(n: CGFloat, icon: CGFloat, spacing: CGFloat)] = [
+            (10, 148, 16), (15, 112, 14), (20, 84, 12), (25, 64, 10), (30, 52, 8),
+        ]
+        var icon = samples[0].icon
+        var spacing = samples[0].spacing
+        if n >= samples.last!.n {
+            icon = samples.last!.icon
+            spacing = samples.last!.spacing
+        } else if n > samples[0].n {
+            for index in 0..<(samples.count - 1) where n >= samples[index].n && n <= samples[index + 1].n {
+                let start = samples[index]
+                let end = samples[index + 1]
+                let t = (n - start.n) / (end.n - start.n)
+                icon = start.icon + (end.icon - start.icon) * t
+                spacing = start.spacing + (end.spacing - start.spacing) * t
+            }
+        }
+        var padX: CGFloat = 14
+        var width = padX * 2 + n * icon + max(0, n - 1) * spacing
+        let limit = max(320, maxWidth - 48)
+        if width > limit {
+            let scale = limit / width
+            icon *= scale
+            spacing *= scale
+            padX *= scale
+            width = padX * 2 + n * icon + max(0, n - 1) * spacing
+        }
+        let height = strip.padTop + icon + strip.padBottom
+        return (icon, spacing, padX, width, height)
+    }
+
+    private func showSelection() {
+        guard items.indices.contains(selection) else { return }
+        strip.selection = selection
+        strip.needsDisplay = true
+    }
+
+    private func click(_ index: Int) {
+        guard items.indices.contains(index) else { return }
+        selection = index
+        strip.selection = index
+        NSCursor.arrow.set()
+        commit()
     }
 
     private func move(forward: Bool) {
@@ -508,8 +739,8 @@ final class Switcher {
         } else {
             selection = (selection - 1 + items.count) % items.count
         }
-        strip.selection = selection
-        strip.needsDisplay = true
+        showSelection()
+        panel.orderFrontRegardless()
     }
 
     private func initialIndex(forward: Bool) -> Int {
@@ -523,17 +754,19 @@ final class Switcher {
     }
 
     private func commit() {
-        guard visible else { return }
-        visible = false
+        guard isVisible() else { return }
+        setVisible(false)
         let app = items.indices.contains(selection) ? items[selection].running : nil
         panel.orderOut(nil)
+        NSCursor.arrow.set()
         app?.activate(from: .current, options: [])
     }
 
     private func cancel() {
-        guard visible else { return }
-        visible = false
+        guard isVisible() else { return }
+        setVisible(false)
         panel.orderOut(nil)
+        NSCursor.arrow.set()
     }
 
     private func targetScreen() -> NSScreen? {
@@ -565,129 +798,41 @@ final class Switcher {
         log(message)
     }
 
-    private func switcherItems() -> (items: [SwitchItem], fromDock: Bool) {
-        if let dock = dockApplicationItems(), !dock.isEmpty {
-            return (dock, true)
-        }
-        return (pinnedRunningApps(), false)
-    }
-
-    /// Application icons on the Dock, in the order they are drawn.
-    private func dockApplicationItems() -> [SwitchItem]? {
-        guard AXIsProcessTrusted(),
-              let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first
-        else { return nil }
-        let application = AXUIElementCreateApplication(dock.processIdentifier)
-        let icons = axDockItems(application, depth: 0).filter {
-            axString($0, kAXSubroleAttribute) == "AXApplicationDockItem"
-        }
-        guard !icons.isEmpty else { return nil }
-        let orientation = (CFPreferencesCopyAppValue("orientation" as CFString, dockDomain) as? String) ?? "bottom"
-        let vertical = orientation == "left" || orientation == "right"
-        var ranked: [(point: CGPoint, item: SwitchItem)] = []
-        var seen = Set<String>()
-        for icon in icons {
-            guard let url = axURL(icon),
-                  let running = runningApp(at: url),
-                  let bundleID = running.bundleIdentifier,
-                  seen.insert(bundleID).inserted
-            else { continue }
-            let fallback = clean(running.localizedName ?? url.deletingPathExtension().lastPathComponent)
-            let label = clean(axString(icon, kAXTitleAttribute) ?? fallback)
-            let point = axPoint(icon) ?? .zero
-            ranked.append((point, SwitchItem(bundleID: bundleID, url: url, label: label, running: running)))
-        }
-        guard !ranked.isEmpty else { return nil }
-        if ranked.contains(where: { axMissing($0.point) }) {
-            return ranked.map(\.item)
-        }
-        ranked.sort { vertical ? $0.point.y < $1.point.y : $0.point.x < $1.point.x }
-        return ranked.map(\.item)
-    }
-
-    private func pinnedRunningApps() -> [SwitchItem] {
-        var items: [SwitchItem] = []
-        var seen = Set<String>()
-        func add(_ app: NSRunningApplication) {
-            guard app.activationPolicy == .regular,
-                  let bundleID = app.bundleIdentifier,
-                  let url = app.bundleURL,
-                  seen.insert(bundleID).inserted
-            else { return }
-            let label = clean(app.localizedName ?? url.deletingPathExtension().lastPathComponent)
-            items.append(SwitchItem(bundleID: bundleID, url: url, label: label, running: app))
-        }
-        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").forEach(add)
-        for tile in dockTiles() {
-            NSRunningApplication.runningApplications(withBundleIdentifier: tileID(tile)).forEach(add)
-        }
-        let others = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }
-            .sorted { ($0.launchDate ?? .distantPast) < ($1.launchDate ?? .distantPast) }
-        others.forEach(add)
-        return items
-    }
-}
-
-private func axMissing(_ point: CGPoint) -> Bool {
-    point == .zero
-}
-
-private func axDockItems(_ element: AXUIElement, depth: Int) -> [AXUIElement] {
-    guard depth <= 4 else { return [] }
-    var found: [AXUIElement] = []
-    for child in axChildren(element) {
-        if axString(child, kAXRoleAttribute) == "AXDockItem" {
-            found.append(child)
-        } else {
-            found.append(contentsOf: axDockItems(child, depth: depth + 1))
+    private func switcherItems() -> [SwitchItem] {
+        guard let spaces = spaceApps() else { return [] }
+        return spaces.compactMap { space in
+            guard let running = NSRunningApplication.runningApplications(withBundleIdentifier: space.bundleID).first else {
+                return nil
+            }
+            return SwitchItem(bundleID: space.bundleID, url: space.url, label: space.label, running: running)
         }
     }
-    return found
 }
 
-private func axChildren(_ element: AXUIElement) -> [AXUIElement] {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success else { return [] }
-    return value as? [AXUIElement] ?? []
-}
-
-private func axString(_ element: AXUIElement, _ attribute: String) -> String? {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success, let value else { return nil }
-    if let string = value as? String { return string }
-    if let url = value as? URL { return url.absoluteString }
-    return nil
-}
-
-private func axURL(_ element: AXUIElement) -> URL? {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &value) == .success, let value else { return nil }
-    if let url = value as? URL { return url }
-    if let string = value as? String { return URL(string: string) }
-    return nil
-}
-
-private func axPoint(_ element: AXUIElement) -> CGPoint? {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &value) == .success,
-          let value,
-          CFGetTypeID(value) == AXValueGetTypeID()
-    else { return nil }
-    var point = CGPoint.zero
-    guard AXValueGetValue(value as! AXValue, .cgPoint, &point) else { return nil }
-    return point
-}
-
-private func runningApp(at url: URL) -> NSRunningApplication? {
-    let path = url.standardizedFileURL.resolvingSymlinksInPath().path
-    if let bundleID = Bundle(url: url)?.bundleIdentifier,
-       let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
-        return app
+/// Full-screen spaces, left to right. This is the order the Dock and the switcher follow.
+private func spaceApps() -> [SpaceApp]? {
+    guard let displays = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]],
+          !displays.isEmpty
+    else {
+        log("Could not read spaces")
+        return nil
     }
-    return NSWorkspace.shared.runningApplications.first {
-        $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath().path == path
+    let ranked = displays.sorted { fullscreenCount($0) > fullscreenCount($1) }
+    guard let display = ranked.first, fullscreenCount(display) > 0 else { return [] }
+    let spaces = display["Spaces"] as? [[String: Any]] ?? []
+    var apps: [SpaceApp] = []
+    var seen = Set<String>()
+    for space in spaces {
+        guard number(space["type"]) == 4, let pid = pidValue(space["pid"]) else { continue }
+        guard let running = NSRunningApplication(processIdentifier: pid),
+              let bundleID = running.bundleIdentifier,
+              let url = running.bundleURL,
+              seen.insert(bundleID).inserted
+        else { continue }
+        let label = clean(running.localizedName ?? url.deletingPathExtension().lastPathComponent)
+        apps.append(SpaceApp(bundleID: bundleID, url: url, label: label))
     }
+    return apps
 }
 
 private func eventMask(_ type: CGEventType) -> CGEventMask {
@@ -763,6 +908,9 @@ private func runSwitcherChecks() {
     check(.swallow, .keyUp, 48, command, true, "tab up")
     check(.pass, .keyUp, 48, command, false, "tab up closed")
     check(.swallow, .keyDown, 12, command, true, "other key")
+    check(.move(forward: true), .keyDown, 124, command, true, "right")
+    check(.move(forward: false), .keyDown, 123, command, true, "left")
+    check(.pass, .keyDown, 123, command, false, "left closed")
     fputs("switcher checks ok\n", stdout)
 }
 #endif
