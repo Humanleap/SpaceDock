@@ -70,7 +70,12 @@ enum Main {
     static func main() {
         #if SPACE_DOCK_TEST
         runSwitcherChecks()
+        runUpdateChecks()
         #else
+        if CommandLine.arguments.contains("--install") {
+            Release.installFromCommandLine()
+            return
+        }
         let app = NSApplication.shared
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
@@ -88,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let switcher = Switcher()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if !Release.stay() { return }
         let timer = Timer(timeInterval: 1.2, repeats: true) { [weak self] _ in
             self?.tick(force: false)
         }
@@ -96,6 +102,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switcher.prepare()
         switcher.start()
         tick(force: false)
+        Release.schedule { [weak self] in
+            guard let self else { return false }
+            return !self.switcher.isStopping && !self.switcher.visible
+        }
     }
 
     private func tick(force: Bool) {
@@ -344,7 +354,7 @@ final class Switcher {
     private var source: CFRunLoopSource?
     private var items: [SwitchItem] = []
     private var selection = 0
-    private var visible = false
+    fileprivate var visible = false
     private var reportedBlocked = false
     private var reportedPass = false
     private var wasTrusted = AXIsProcessTrusted()
@@ -875,7 +885,7 @@ private func clean(_ label: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private func log(_ message: String) {
+func log(_ message: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
     fputs("\(stamp) \(message)\n", stderr)
 }
@@ -912,5 +922,25 @@ private func runSwitcherChecks() {
     check(.move(forward: false), .keyDown, 123, command, true, "left")
     check(.pass, .keyDown, 123, command, false, "left closed")
     fputs("switcher checks ok\n", stdout)
+}
+
+private func runUpdateChecks() {
+    func expect(_ condition: Bool, _ name: String) {
+        if !condition {
+            fputs("fail \(name)\n", stderr)
+            exit(1)
+        }
+    }
+    expect(versionIsNewer("v1.0.1", than: "1.0"), "patch")
+    expect(!versionIsNewer("v1.0", than: "1.0"), "same")
+    expect(!versionIsNewer("1.0", than: "1.0.1"), "older")
+    expect(versionIsNewer("1.2", than: "1.1.9"), "minor")
+    expect(versionIsNewer("v2", than: "1.9.9"), "major")
+    expect(versionParts("V1.0") == [1, 0], "prefix")
+    expect(allowedDownload(URL(string: "https://github.com/Humanleap/SpaceDock/releases/download/v1.0/SpaceDock-1.0.dmg")!), "github")
+    expect(allowedDownload(URL(string: "https://objects.githubusercontent.com/releases/app.dmg")!), "objects")
+    expect(!allowedDownload(URL(string: "http://github.com/Humanleap/SpaceDock/app.dmg")!), "http")
+    expect(!allowedDownload(URL(string: "https://evil.example/app.dmg")!), "other host")
+    fputs("update checks ok\n", stdout)
 }
 #endif

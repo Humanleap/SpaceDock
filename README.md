@@ -12,7 +12,11 @@ Spaces stay in charge. Move a full-screen app and the Dock follows. Command-Tab 
 
 ## Install
 
-macOS 14 or later, and the Xcode command line tools.
+Download the latest [SpaceDock disk image](https://github.com/Humanleap/SpaceDock/releases/latest) and open SpaceDock. It installs for this user and starts again at login.
+
+The first open can ask you to allow it in Privacy & Security. Allow it there, then open it again.
+
+Or build it. You need macOS 14 or later and the Xcode command line tools.
 
 ```
 git clone https://github.com/Humanleap/SpaceDock.git
@@ -28,7 +32,9 @@ It starts again at login. `make uninstall` removes it.
 
 ## Update
 
-In the SpaceDock folder:
+A copy installed from the disk image checks for a new release and switches to it.
+
+A copy built with `make install` stays on that build. In the SpaceDock folder:
 
 ```
 make update
@@ -37,6 +43,8 @@ make update
 That downloads the latest copy, rebuilds it, and starts it again. Updating on the same Mac keeps the Accessibility permission.
 
 To sign it with your own certificate: `make install SIGN_ID="Apple Development: Your Name (TEAMID)"`.
+
+To publish a release, bump `CFBundleShortVersionString` and `CFBundleVersion` in Info.plist, commit, and run `make release`.
 
 ## What it changes
 
