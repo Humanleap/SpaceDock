@@ -72,7 +72,8 @@ enum Release {
     static func stay() -> Bool {
         let here = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
         if here != installedApp().resolvingSymlinksInPath().standardizedFileURL.path {
-            if staged(Bundle.main.bundleURL, team: nil) && handOff() { exit(0) }
+            let team = FileManager.default.fileExists(atPath: installedApp().path) ? teamID(installedApp()) : nil
+            if staged(Bundle.main.bundleURL, team: team) && handOff() { exit(0) }
             log("Could not install SpaceDock.")
             return true
         }
@@ -254,7 +255,12 @@ private func writeHelper(parent: pid_t) {
         n=$((n + 1))
         sleep 0.2
       done
-      mv "$incoming" "$dest" || echo "SpaceDock swap failed" >> "$log"
+      if [ -e "$dest" ]; then
+        echo "SpaceDock swap failed" >> "$log"
+        rm -rf "$incoming"
+      else
+        mv "$incoming" "$dest" || echo "SpaceDock swap failed" >> "$log"
+      fi
     fi
     xattr -dr com.apple.quarantine "$dest" || true
     launchctl bootstrap "gui/$uid" "$home/Library/LaunchAgents/\(releaseID).plist" \
