@@ -1,6 +1,10 @@
 # SpaceDock
 
-<img src="docs/how-it-works.png" alt="Before, the Dock and Command-Tab use their own order. After, they follow your screens, left to right.">
+<p align="center">
+  <img src="Resources/AppIcon.png" width="128" alt="SpaceDock">
+</p>
+
+<img src="docs/how-it-works.png" alt="Before, Spaces, the Dock, and the app switcher each use their own order. After, the Dock and the switcher follow your screens.">
 
 SpaceDock keeps the Mac Dock in the same left-to-right order as your full-screen Spaces. Command-Tab lists those same full-screen apps, in that order.
 
