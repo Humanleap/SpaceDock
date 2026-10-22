@@ -1,5 +1,7 @@
 # SpaceDock
 
+<img src="docs/how-it-works.png" alt="Your screens set the order. The Dock and Command-Tab follow, left to right.">
+
 SpaceDock keeps the Mac Dock in the same left-to-right order as your full-screen Spaces. Command-Tab lists those same full-screen apps, in that order.
 
 Spaces stay in charge. Move a full-screen app and the Dock follows. Command-Tab lists the same apps, left to right. Let go of Command to switch. Shift goes backwards. Escape cancels.
